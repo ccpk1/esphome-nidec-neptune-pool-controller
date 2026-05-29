@@ -1,5 +1,13 @@
 # esphome-nidec-neptune-pool-controller
-ESPHome configuration for the Waveshare Industrial ESP32-S3-Relay-6CH.  Built to integrate with the Nidec Neptune (NPTQ270) Modbus protocol, native to Waterway Power Defender (PD) variable speed pumps. Features robust split-surface intent architecture, adaptive RPM guardrails, safety-locked liquid chlorine dosing injection, and 7-day rolling historical telemetry tracking.
+While the DIY pool automation community has extensively documented and solved integrations for Pentair and Hayward pumps, information on Waterway variable speed pumps is almost non-existent. After seeing countless forum threads where users completely gave up trying to interface with these units, I spent a few days reverse-engineering the communication protocol to bridge the gap.
+
+This repository provides a production-grade ESPHome reference architecture built specifically for the **Waveshare Industrial ESP32-S3-Relay-6CH**. It delivers native Modbus RTU control for the Nidec Neptune (NPTQ270) motor controller, which powers the Waterway Power Defender (PD) pump series.
+
+> ⚠️ **Protocol Note:** The Nidec Neptune controller is fundamentally based on the **X17 Modbus protocol**, but it utilizes a significantly scaled-down, limited implementation. Standard X17 documentation will mislead you—this configuration handles the specific initialization sequences and register quirks required to actually make the pump respond reliably.
+
+Beyond basic pump control, this architecture acts as a complete pool-pad subsystem. It features a robust split-surface intent architecture, adaptive hardware RPM guardrails, a safety-locked liquid chlorine dosing injection system, and a 7-day rolling historical telemetry tracking matrix stored right on the flash chip.
+
+---
 
 ## Built and Tested On:
 
