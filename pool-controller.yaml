@@ -1,0 +1,2483 @@
+## Pool controller architecture
+##
+## This controller has two main jobs:
+## - Water pump control: manage the circulation pump's enable state, RPM target,
+##   communication state, and RPM guardrails.
+## - Chlorine pump dosing: manage requested chlorine doses, execution safety checks,
+##   tank state, and delivery tracking.
+##
+## Both domains keep public intent separate from low-level execution:
+## - Intent surfaces: human-facing values that Home Assistant or an operator sets.
+##   Examples: Water Pump RPM Target, operating or override min/max numbers,
+##   chlorine dose requests, and chlorine tank adjustments.
+## - Command and execution surfaces: internal write paths and scripts that send the final
+##   clamped water pump command or run a chlorine dose. These stay internal so the public
+##   model does not expose protocol details or implementation plumbing.
+##
+## Water pump concepts used below:
+## - Physical limits: the hard pump capabilities from substitutions (`water_pump_min_rpm` and
+##   `water_pump_max_rpm`). Nothing can command outside this range.
+## - Operating limits: the normal allowed working range for day-to-day automation.
+## - Override limits: a temporary alternate min and/or max RPM range that can be enabled when
+##   a special operating condition needs it.
+## - Override target: a temporary specific RPM request that can replace the normal target
+##   while still respecting the physical pump limits and any active effective limits.
+## - Effective limits: the live min/max range after combining the normal operating limits
+##   with any enabled override limits.
+## - Target: the requested RPM, either from the normal public target or the temporary override target.
+## - Command: the final RPM actually written to the pump after clamping the target to the
+##   current effective limits.
+##
+## Chlorine concepts used below:
+## - Request: the desired chlorine dose staged in either oz or ppm.
+## - Execution: a separate explicit step that starts the currently requested dose.
+## - Safety gates: dosing only runs when calibration is valid, the request is valid,
+##   maintenance lockout is off, and the water pump is confirmed running.
+## - Tracking: the controller records chlorine runtime, delivered oz, delivered ppm,
+##   last executed dose, tank level, and blocked or abort reasons.
+##
+## On boot, the controller restores persisted state, recalculates derived request and limit values,
+## reclamps the public pump target if needed, and republishes the current diagnostic state.
+esphome:
+  name: "${device_name}"
+  friendly_name: "${device_friendly_name}"
+  on_boot:
+    priority: -100
+    then:
+      - lambda: |-
+          const float pool_volume = id(pool_volume_gallons).state;
+          const float chlorine_strength = id(chlorine_pump_liquid_strength_percent).state;
+          float requested_ppm = 0.0f;
+          if (pool_volume > 0.0f && chlorine_strength > 0.0f) {
+            requested_ppm = id(chlorine_pump_dose_request_oz).state * chlorine_strength * 10000.0f / (128.0f * pool_volume);
+          }
+          id(chlorine_pump_dose_request_ppm).publish_state(requested_ppm);
+          id(chlorine_pump_dose_blocked_reason).publish_state(id(chlorine_pump_blocked_reason_state));
+          float chlorine_tank_capacity = id(chlorine_pump_tank_capacity_oz).state;
+          float chlorine_tank_level = id(chlorine_pump_tank_level_oz).state;
+          if (chlorine_tank_capacity < 0.0f) {
+            chlorine_tank_capacity = 0.0f;
+            id(chlorine_pump_tank_capacity_oz).publish_state(chlorine_tank_capacity);
+          }
+          if (chlorine_tank_level > chlorine_tank_capacity) {
+            chlorine_tank_level = chlorine_tank_capacity;
+            id(chlorine_pump_tank_level_oz).publish_state(chlorine_tank_level);
+          }
+          if (chlorine_tank_level < 0.0f) {
+            chlorine_tank_level = 0.0f;
+            id(chlorine_pump_tank_level_oz).publish_state(chlorine_tank_level);
+          }
+          float chlorine_tank_low_threshold = id(chlorine_pump_tank_low_threshold_oz).state;
+          if (chlorine_tank_low_threshold > chlorine_tank_capacity) {
+            chlorine_tank_low_threshold = chlorine_tank_capacity;
+            id(chlorine_pump_tank_low_threshold_oz).publish_state(chlorine_tank_low_threshold);
+          }
+          float operating_min_rpm = id(water_pump_operating_min_rpm).state;
+          float operating_max_rpm = id(water_pump_operating_max_rpm).state;
+          if (operating_min_rpm < ${water_pump_min_rpm}) {
+            operating_min_rpm = ${water_pump_min_rpm};
+            id(water_pump_operating_min_rpm).publish_state(operating_min_rpm);
+          }
+          if (operating_max_rpm > ${water_pump_max_rpm}) {
+            operating_max_rpm = ${water_pump_max_rpm};
+            id(water_pump_operating_max_rpm).publish_state(operating_max_rpm);
+          }
+          if (operating_max_rpm < operating_min_rpm) {
+            operating_max_rpm = operating_min_rpm;
+            id(water_pump_operating_max_rpm).publish_state(operating_max_rpm);
+          }
+          float override_min_rpm = id(water_pump_min_rpm_override).state;
+          float override_max_rpm = id(water_pump_max_rpm_override).state;
+          if (override_min_rpm < ${water_pump_min_rpm}) {
+            override_min_rpm = ${water_pump_min_rpm};
+            id(water_pump_min_rpm_override).publish_state(override_min_rpm);
+          }
+          if (override_max_rpm > ${water_pump_max_rpm}) {
+            override_max_rpm = ${water_pump_max_rpm};
+            id(water_pump_max_rpm_override).publish_state(override_max_rpm);
+          }
+          if (override_max_rpm < override_min_rpm) {
+            override_max_rpm = override_min_rpm;
+            id(water_pump_max_rpm_override).publish_state(override_max_rpm);
+          }
+          float requested_rpm = id(water_pump_rpm_target_request).state;
+          if (requested_rpm < ${water_pump_min_rpm}) {
+            requested_rpm = ${water_pump_min_rpm};
+            id(water_pump_rpm_target_request).publish_state(requested_rpm);
+          }
+          if (requested_rpm > ${water_pump_max_rpm}) {
+            requested_rpm = ${water_pump_max_rpm};
+            id(water_pump_rpm_target_request).publish_state(requested_rpm);
+          }
+          float override_target_rpm = id(water_pump_target_rpm_override).state;
+          if (override_target_rpm < ${water_pump_min_rpm}) {
+            override_target_rpm = ${water_pump_min_rpm};
+            id(water_pump_target_rpm_override).publish_state(override_target_rpm);
+          }
+          if (override_target_rpm > ${water_pump_max_rpm}) {
+            override_target_rpm = ${water_pump_max_rpm};
+            id(water_pump_target_rpm_override).publish_state(override_target_rpm);
+          }
+      - script.execute: apply_water_pump_rpm_request
+
+# Template adaptation notes:
+# - Change substitutions first when reusing this file for another installation.
+# - Hardware pins, Modbus settings, relay labels, thresholds, and default pool values
+#   are intended to be customized here without editing the logic below.
+# - Runtime-tunable calibration values such as pool volume and chlorine pump rates
+#   remain exposed as Home Assistant number entities later in the file.
+substitutions:
+  # --------------------------------------------------------
+  # 1. Controller identity and platform
+  # --------------------------------------------------------
+  device_name: pool-controller
+  device_friendly_name: Pool Controller
+  flash_write_interval: 4h
+  controller_poll_interval: 5s
+  slow_template_update_interval: 30s
+  buzzer_pin: GPIO21
+  status_led_pin: GPIO38
+  
+  default_pool_volume_gallons: "10000"
+
+  # --------------------------------------------------------
+  # 2. Water pump communications, thresholds, and defaults
+  # --------------------------------------------------------
+  modbus_uart_tx_pin: GPIO17
+  modbus_uart_rx_pin: GPIO18
+  modbus_uart_baud_rate: "9600"
+  water_pump_modbus_address: "240"
+  modbus_command_throttle: 200ms
+  water_pump_min_rpm: "600"
+  water_pump_max_rpm: "3450"
+  water_pump_running_min_rpm: "600"
+  water_pump_running_min_watts: "10"
+  default_water_pump_comm_stale_seconds: "20"
+
+  # Flow calibration curve
+  # Replace these values with measured GPM at each RPM point for a new installation.
+  # GPM can be estimated from filter pressure measurements and then refined with
+  # real-world performance observations for the specific pool plumbing setup.
+  water_pump_flow_gpm_at_600_rpm: "12.5"
+  water_pump_flow_gpm_at_900_rpm: "18.8"
+  water_pump_flow_gpm_at_1200_rpm: "25.0"
+  water_pump_flow_gpm_at_1500_rpm: "31.3"
+  water_pump_flow_gpm_at_1800_rpm: "37.5"
+  water_pump_flow_gpm_at_2100_rpm: "43.8"
+  water_pump_flow_gpm_at_2400_rpm: "50.0"
+  water_pump_flow_gpm_at_2700_rpm: "56.3"
+  water_pump_flow_gpm_at_3000_rpm: "62.5"
+  water_pump_flow_gpm_at_3300_rpm: "68.8"
+  water_pump_flow_gpm_at_3450_rpm: "72.0"
+
+
+  # --------------------------------------------------------
+  # 3. Chlorine pump subsystem (Relay 1)
+  # --------------------------------------------------------
+  relay_1_pin: GPIO1
+  relay_1_name: Chlorine Pump
+  default_chlorine_pump_dose_request_oz: "8.0"
+  default_chlorine_pump_max_single_dose_oz: "64.0"
+  default_chlorine_pump_max_daily_dose_ppm: "12.0"
+  default_chlorine_pump_liquid_strength_percent: "10.0"
+  default_chlorine_pump_pre_run_seconds: "30"
+  default_chlorine_pump_post_run_seconds: "300"
+  default_chlorine_pump_minimum_rest_seconds: "900"
+  default_chlorine_pump_tank_capacity_oz: "960"
+  default_chlorine_pump_tank_level_oz: "512"
+  default_chlorine_pump_tank_low_threshold_oz: "32"
+  default_chlorine_pump_oz_per_min: "1.0"
+  default_chlorine_pump_power_watts: "90"
+
+  # --------------------------------------------------------
+  # 4. Relay 2 spare output - not yet implemented
+  # --------------------------------------------------------
+  relay_2_pin: GPIO2
+  relay_2_name: Relay 2
+
+  # --------------------------------------------------------
+  # 5. Relay 3 spare output - not yet implemented
+  # --------------------------------------------------------
+  relay_3_pin: GPIO41
+  relay_3_name: Relay 3
+
+  # --------------------------------------------------------
+  # 6. Relay 4 spare output - not yet implemented
+  # --------------------------------------------------------
+  relay_4_pin: GPIO42
+  relay_4_name: Relay 4
+
+  # --------------------------------------------------------
+  # 7. Relay 5 spare output - not yet implemented
+  # --------------------------------------------------------
+  relay_5_pin: GPIO45
+  relay_5_name: Relay 5
+
+  # --------------------------------------------------------
+  # 8. Relay 6 spare output - not yet implemented
+  # --------------------------------------------------------
+  relay_6_pin: GPIO46
+  relay_6_name: Relay 6
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 8MB
+  framework:
+    type: arduino
+
+logger:
+  level: INFO
+
+preferences:
+  # These counters change frequently while the pump is running.
+  # Batch preference writes so we do not commit every counter update to flash,
+  # while still limiting restart loss for short-horizon counters.
+  flash_write_interval: "${flash_write_interval}"
+
+api:
+  encryption:
+    key: !secret esp_api_key
+  actions:
+    - action: rtttl_play
+      variables:
+        song_str: string
+      then:
+        - rtttl.play:
+            rtttl: !lambda 'return song_str;'
+    - action: chlorine_pump_request_dose_oz
+      variables:
+        dose_oz: float
+      then:
+        - lambda: |-
+            id(chlorine_pump_dose_request_oz).publish_state(dose_oz);
+            const float pool_volume = id(pool_volume_gallons).state;
+            const float chlorine_strength = id(chlorine_pump_liquid_strength_percent).state;
+            float requested_ppm = 0.0f;
+            if (pool_volume > 0.0f && chlorine_strength > 0.0f) {
+              requested_ppm = dose_oz * chlorine_strength * 10000.0f / (128.0f * pool_volume);
+            }
+            id(chlorine_pump_dose_request_ppm).publish_state(requested_ppm);
+            id(chlorine_pump_blocked_reason_state) = "idle";
+            id(chlorine_pump_dose_blocked_reason).publish_state(id(chlorine_pump_blocked_reason_state));
+            esphome::global_preferences->sync();
+    - action: chlorine_pump_request_dose_ppm
+      variables:
+        dose_ppm: float
+      then:
+        - lambda: |-
+            const float pool_volume = id(pool_volume_gallons).state;
+            const float chlorine_strength = id(chlorine_pump_liquid_strength_percent).state;
+            if (pool_volume <= 0.0f || chlorine_strength <= 0.0f) {
+              id(chlorine_pump_dose_request_oz).publish_state(0.0f);
+              id(chlorine_pump_dose_request_ppm).publish_state(0.0f);
+              id(chlorine_pump_blocked_reason_state) = "invalid_chemistry_config";
+              id(chlorine_pump_dose_blocked_reason).publish_state(id(chlorine_pump_blocked_reason_state));
+              esphome::global_preferences->sync();
+              return;
+            }
+
+            const float requested_oz = dose_ppm * 128.0f * pool_volume / (chlorine_strength * 10000.0f);
+            id(chlorine_pump_dose_request_ppm).publish_state(dose_ppm);
+            id(chlorine_pump_dose_request_oz).publish_state(requested_oz);
+            id(chlorine_pump_blocked_reason_state) = "idle";
+            id(chlorine_pump_dose_blocked_reason).publish_state(id(chlorine_pump_blocked_reason_state));
+            esphome::global_preferences->sync();
+    - action: chlorine_pump_execute_requested_dose
+      then:
+        - script.execute: execute_requested_chlorine_pump_dose
+
+ota:
+  - platform: esphome
+    password: !secret esp_ota_password
+    id: pool_controller_ota
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  domain: !secret wifi_domain
+
+captive_portal:
+
+web_server:
+  port: 80
+
+bluetooth_proxy:
+  active: true
+
+time:
+  - platform: homeassistant
+    id: homeassistant_time
+    on_time:
+      - seconds: 0
+        minutes: 0
+        hours: 0
+        then:
+          - lambda: |-
+              id(water_pump_runtime_day_6_seconds) = id(water_pump_runtime_day_5_seconds);
+              id(water_pump_runtime_day_5_seconds) = id(water_pump_runtime_day_4_seconds);
+              id(water_pump_runtime_day_4_seconds) = id(water_pump_runtime_day_3_seconds);
+              id(water_pump_runtime_day_3_seconds) = id(water_pump_runtime_day_2_seconds);
+              id(water_pump_runtime_day_2_seconds) = id(water_pump_runtime_day_1_seconds);
+              id(water_pump_runtime_day_1_seconds) = id(water_pump_runtime_day_0_seconds);
+              id(water_pump_runtime_day_0_seconds) = 0;
+
+              id(water_pump_energy_day_6_wh) = id(water_pump_energy_day_5_wh);
+              id(water_pump_energy_day_5_wh) = id(water_pump_energy_day_4_wh);
+              id(water_pump_energy_day_4_wh) = id(water_pump_energy_day_3_wh);
+              id(water_pump_energy_day_3_wh) = id(water_pump_energy_day_2_wh);
+              id(water_pump_energy_day_2_wh) = id(water_pump_energy_day_1_wh);
+              id(water_pump_energy_day_1_wh) = id(water_pump_energy_day_0_wh);
+              id(water_pump_energy_day_0_wh) = 0.0f;
+
+              id(water_pump_gallons_day_6) = id(water_pump_gallons_day_5);
+              id(water_pump_gallons_day_5) = id(water_pump_gallons_day_4);
+              id(water_pump_gallons_day_4) = id(water_pump_gallons_day_3);
+              id(water_pump_gallons_day_3) = id(water_pump_gallons_day_2);
+              id(water_pump_gallons_day_2) = id(water_pump_gallons_day_1);
+              id(water_pump_gallons_day_1) = id(water_pump_gallons_day_0);
+              id(water_pump_gallons_day_0) = 0.0f;
+
+              id(chlorine_pump_runtime_day_6_seconds) = id(chlorine_pump_runtime_day_5_seconds);
+              id(chlorine_pump_runtime_day_5_seconds) = id(chlorine_pump_runtime_day_4_seconds);
+              id(chlorine_pump_runtime_day_4_seconds) = id(chlorine_pump_runtime_day_3_seconds);
+              id(chlorine_pump_runtime_day_3_seconds) = id(chlorine_pump_runtime_day_2_seconds);
+              id(chlorine_pump_runtime_day_2_seconds) = id(chlorine_pump_runtime_day_1_seconds);
+              id(chlorine_pump_runtime_day_1_seconds) = id(chlorine_pump_runtime_day_0_seconds);
+              id(chlorine_pump_runtime_day_0_seconds) = 0;
+
+              id(chlorine_pump_oz_day_6) = id(chlorine_pump_oz_day_5);
+              id(chlorine_pump_oz_day_5) = id(chlorine_pump_oz_day_4);
+              id(chlorine_pump_oz_day_4) = id(chlorine_pump_oz_day_3);
+              id(chlorine_pump_oz_day_3) = id(chlorine_pump_oz_day_2);
+              id(chlorine_pump_oz_day_2) = id(chlorine_pump_oz_day_1);
+              id(chlorine_pump_oz_day_1) = id(chlorine_pump_oz_day_0);
+              id(chlorine_pump_oz_day_0) = 0.0f;
+
+              id(chlorine_pump_ppm_day_6) = id(chlorine_pump_ppm_day_5);
+              id(chlorine_pump_ppm_day_5) = id(chlorine_pump_ppm_day_4);
+              id(chlorine_pump_ppm_day_4) = id(chlorine_pump_ppm_day_3);
+              id(chlorine_pump_ppm_day_3) = id(chlorine_pump_ppm_day_2);
+              id(chlorine_pump_ppm_day_2) = id(chlorine_pump_ppm_day_1);
+              id(chlorine_pump_ppm_day_1) = id(chlorine_pump_ppm_day_0);
+              id(chlorine_pump_ppm_day_0) = 0.0f;
+
+              id(chlorine_pump_energy_day_6_wh) = id(chlorine_pump_energy_day_5_wh);
+              id(chlorine_pump_energy_day_5_wh) = id(chlorine_pump_energy_day_4_wh);
+              id(chlorine_pump_energy_day_4_wh) = id(chlorine_pump_energy_day_3_wh);
+              id(chlorine_pump_energy_day_3_wh) = id(chlorine_pump_energy_day_2_wh);
+              id(chlorine_pump_energy_day_2_wh) = id(chlorine_pump_energy_day_1_wh);
+              id(chlorine_pump_energy_day_1_wh) = id(chlorine_pump_energy_day_0_wh);
+              id(chlorine_pump_energy_day_0_wh) = 0.0f;
+
+              esphome::global_preferences->sync();
+
+globals:
+  - id: water_pump_runtime_day_0_seconds
+    type: uint32_t
+    restore_value: yes
+    initial_value: '0'
+  - id: water_pump_runtime_day_1_seconds
+    type: uint32_t
+    restore_value: yes
+    initial_value: '0'
+  - id: water_pump_runtime_day_2_seconds
+    type: uint32_t
+    restore_value: yes
+    initial_value: '0'
+  - id: water_pump_runtime_day_3_seconds
+    type: uint32_t
+    restore_value: yes
+    initial_value: '0'
+  - id: water_pump_runtime_day_4_seconds
+    type: uint32_t
+    restore_value: yes
+    initial_value: '0'
+  - id: water_pump_runtime_day_5_seconds
+    type: uint32_t
+    restore_value: yes
+    initial_value: '0'
+  - id: water_pump_runtime_day_6_seconds
+    type: uint32_t
+    restore_value: yes
+    initial_value: '0'
+  - id: water_pump_energy_day_0_wh
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+  - id: water_pump_energy_day_1_wh
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+  - id: water_pump_energy_day_2_wh
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+  - id: water_pump_energy_day_3_wh
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+  - id: water_pump_energy_day_4_wh
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+  - id: water_pump_energy_day_5_wh
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+  - id: water_pump_energy_day_6_wh
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+  - id: water_pump_gallons_day_0
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+  - id: water_pump_gallons_day_1
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+  - id: water_pump_gallons_day_2
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+  - id: water_pump_gallons_day_3
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+  - id: water_pump_gallons_day_4
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+  - id: water_pump_gallons_day_5
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+  - id: water_pump_gallons_day_6
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+  - id: chlorine_pump_runtime_day_0_seconds
+    type: uint32_t
+    restore_value: yes
+    initial_value: '0'
+  - id: chlorine_pump_runtime_day_1_seconds
+    type: uint32_t
+    restore_value: yes
+    initial_value: '0'
+  - id: chlorine_pump_runtime_day_2_seconds
+    type: uint32_t
+    restore_value: yes
+    initial_value: '0'
+  - id: chlorine_pump_runtime_day_3_seconds
+    type: uint32_t
+    restore_value: yes
+    initial_value: '0'
+  - id: chlorine_pump_runtime_day_4_seconds
+    type: uint32_t
+    restore_value: yes
+    initial_value: '0'
+  - id: chlorine_pump_runtime_day_5_seconds
+    type: uint32_t
+    restore_value: yes
+    initial_value: '0'
+  - id: chlorine_pump_runtime_day_6_seconds
+    type: uint32_t
+    restore_value: yes
+    initial_value: '0'
+  - id: chlorine_pump_oz_day_0
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+  - id: chlorine_pump_oz_day_1
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+  - id: chlorine_pump_oz_day_2
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+  - id: chlorine_pump_oz_day_3
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+  - id: chlorine_pump_oz_day_4
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+  - id: chlorine_pump_oz_day_5
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+  - id: chlorine_pump_oz_day_6
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+  - id: chlorine_pump_ppm_day_0
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+  - id: chlorine_pump_ppm_day_1
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+  - id: chlorine_pump_ppm_day_2
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+  - id: chlorine_pump_ppm_day_3
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+  - id: chlorine_pump_ppm_day_4
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+  - id: chlorine_pump_ppm_day_5
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+  - id: chlorine_pump_ppm_day_6
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+  - id: chlorine_pump_energy_day_0_wh
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+  - id: chlorine_pump_energy_day_1_wh
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+  - id: chlorine_pump_energy_day_2_wh
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+  - id: chlorine_pump_energy_day_3_wh
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+  - id: chlorine_pump_energy_day_4_wh
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+  - id: chlorine_pump_energy_day_5_wh
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+  - id: chlorine_pump_energy_day_6_wh
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+  - id: chlorine_pump_dose_lockout_state
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+  - id: water_pump_last_telemetry_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: chlorine_pump_dose_active_state
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: chlorine_pump_dose_request_valid_state
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: chlorine_pump_started_water_pump_by_controller
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: chlorine_pump_dose_runtime_seconds_pending
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: chlorine_pump_dose_total_runtime_seconds_requested
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: chlorine_pump_last_executed_oz
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+  - id: chlorine_pump_last_executed_ppm
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+  - id: chlorine_pump_last_completed_runtime_seconds
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+  - id: chlorine_pump_last_dose_completed_epoch
+    type: uint32_t
+    restore_value: yes
+    initial_value: '0'
+  - id: chlorine_pump_blocked_reason_state
+    type: std::string
+    restore_value: no
+    initial_value: '"idle"'
+
+interval:
+  - interval: ${controller_poll_interval}
+    then:
+      - if:
+          condition:
+            binary_sensor.is_on: water_pump_running_confirmed
+          then:
+            - lambda: |-
+                id(water_pump_runtime_day_0_seconds) += 5;
+                if (id(water_pump_flow_estimated_gpm).state > 0.0f) {
+                  id(water_pump_gallons_day_0) += id(water_pump_flow_estimated_gpm).state / 12.0f;
+                }
+                if (id(water_pump_power).state > 0.0f) {
+                  id(water_pump_energy_day_0_wh) += id(water_pump_power).state / 720.0f;
+                }
+      - if:
+          condition:
+            switch.is_on: relay1
+          then:
+            - lambda: |-
+                const float delivered_oz = id(chlorine_pump_oz_per_min).state / 12.0f;
+                id(chlorine_pump_runtime_day_0_seconds) += 5;
+                id(chlorine_pump_oz_day_0) += delivered_oz;
+                float chlorine_tank_level = id(chlorine_pump_tank_level_oz).state - delivered_oz;
+                if (chlorine_tank_level < 0.0f) {
+                  chlorine_tank_level = 0.0f;
+                }
+                id(chlorine_pump_tank_level_oz).publish_state(chlorine_tank_level);
+                const float pool_volume = id(pool_volume_gallons).state;
+                const float chlorine_strength = id(chlorine_pump_liquid_strength_percent).state;
+                if (pool_volume > 0.0f && chlorine_strength > 0.0f) {
+                  id(chlorine_pump_ppm_day_0) += delivered_oz * chlorine_strength * 10000.0f / (128.0f * pool_volume);
+                }
+                if (id(chlorine_pump_power_watts).state > 0.0f) {
+                  id(chlorine_pump_energy_day_0_wh) += id(chlorine_pump_power_watts).state / 720.0f;
+                }
+                id(chlorine_pump_dose_runtime_seconds_pending) = std::max(0.0f, id(chlorine_pump_dose_runtime_seconds_pending) - 5.0f);
+      - if:
+          condition:
+            lambda: |-
+              return id(chlorine_pump_dose_active_state) && (!id(water_pump_comm_healthy).state || !id(water_pump_running_confirmed).state);
+          then:
+            - lambda: |-
+                if (!id(water_pump_comm_healthy).state) {
+                  id(chlorine_pump_blocked_reason_state) = "dose_aborted_water_pump_comm_stale";
+                } else {
+                  id(chlorine_pump_blocked_reason_state) = "dose_aborted_water_pump_stopped";
+                }
+            - script.execute: stop_active_chlorine_pump_dose
+
+# Onboard Hardware Buzzer Component
+output:
+  - platform: ledc
+    pin: ${buzzer_pin}
+    id: buzzer_pwm
+
+rtttl:
+  output: buzzer_pwm
+  id: pool_buzzer
+  gain: 30%
+
+# Onboard Status LED Component
+light:
+  - platform: esp32_rmt_led_strip
+    chipset: ws2812
+    pin: ${status_led_pin}
+    num_leds: 1
+    rgb_order: RGB
+    name: "RGB LED"
+    id: rgb_led
+
+# --------------------------------------------------------
+# RS-485 SERIAL CONFIGURATION
+# --------------------------------------------------------
+
+uart:
+  tx_pin: ${modbus_uart_tx_pin}
+  rx_pin: ${modbus_uart_rx_pin}
+  baud_rate: ${modbus_uart_baud_rate}
+  stop_bits: 1
+  id: modbus_uart
+
+modbus:
+  id: water_pump_bus
+  uart_id: modbus_uart
+
+modbus_controller:
+  - id: pd140
+    address: ${water_pump_modbus_address}
+    modbus_id: water_pump_bus
+    setup_priority: -10
+    command_throttle: ${modbus_command_throttle}
+    update_interval: ${controller_poll_interval}
+
+# --------------------------------------------------------
+# NIDEC NPTQ270 REGISTER MAP
+# --------------------------------------------------------
+
+sensor:
+  - platform: wifi_signal
+    id: controller_wifi_signal_dbm
+    name: "Controller WiFi Signal"
+    update_interval: ${slow_template_update_interval}
+    unit_of_measurement: "dBm"
+    entity_category: diagnostic
+
+  - platform: uptime
+    name: "Controller Uptime"
+    update_interval: ${slow_template_update_interval}
+    entity_category: diagnostic
+
+  - platform: template
+    id: water_pump_flow_estimated_gpm
+    name: "Water Pump Flow Estimate"
+    lambda: |-
+      if (!id(water_pump_running_confirmed).state) {
+        return 0.0f;
+      }
+      const float rpm = id(water_pump_current_rpm).state;
+      if (rpm <= 0.0f) {
+        return 0.0f;
+      }
+
+      static const size_t point_count = 11;
+      static const float rpm_points[point_count] = {
+          600.0f, 900.0f, 1200.0f, 1500.0f, 1800.0f, 2100.0f,
+          2400.0f, 2700.0f, 3000.0f, 3300.0f, 3450.0f};
+      static const float flow_points[point_count] = {
+          ${water_pump_flow_gpm_at_600_rpm}, ${water_pump_flow_gpm_at_900_rpm}, ${water_pump_flow_gpm_at_1200_rpm},
+          ${water_pump_flow_gpm_at_1500_rpm}, ${water_pump_flow_gpm_at_1800_rpm}, ${water_pump_flow_gpm_at_2100_rpm},
+          ${water_pump_flow_gpm_at_2400_rpm}, ${water_pump_flow_gpm_at_2700_rpm}, ${water_pump_flow_gpm_at_3000_rpm},
+          ${water_pump_flow_gpm_at_3300_rpm}, ${water_pump_flow_gpm_at_3450_rpm}};
+
+      float estimated_gpm = 0.0f;
+      if (rpm <= rpm_points[0]) {
+        estimated_gpm = (rpm / rpm_points[0]) * flow_points[0];
+      } else {
+        estimated_gpm = flow_points[point_count - 1];
+        for (size_t index = 1; index < point_count; index++) {
+          if (rpm <= rpm_points[index]) {
+            const float range = rpm_points[index] - rpm_points[index - 1];
+            const float ratio = (rpm - rpm_points[index - 1]) / range;
+            estimated_gpm = flow_points[index - 1] + ratio * (flow_points[index] - flow_points[index - 1]);
+            break;
+          }
+        }
+      }
+
+      return estimated_gpm > 0.0f ? estimated_gpm : 0.0f;
+    unit_of_measurement: "gpm"
+    icon: mdi:waves-arrow-right
+    accuracy_decimals: 1
+    update_interval: ${controller_poll_interval}
+
+  - platform: template
+    id: water_pump_runtime_today
+    name: "Water Pump Runtime Today"
+    lambda: |-
+      return id(water_pump_runtime_day_0_seconds) / 3600.0f;
+    unit_of_measurement: "h"
+    device_class: duration
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: mdi:timer-outline
+    update_interval: ${slow_template_update_interval}
+
+  - platform: template
+    id: water_pump_gallons_today
+    name: "Water Pump Gallons Today"
+    lambda: |-
+      return id(water_pump_gallons_day_0);
+    unit_of_measurement: "gal"
+    state_class: measurement
+    accuracy_decimals: 0
+    icon: mdi:waves-arrow-right
+    update_interval: ${slow_template_update_interval}
+
+  - platform: template
+    id: water_pump_gallons_yesterday
+    name: "Water Pump Gallons Yesterday"
+    lambda: |-
+      return id(water_pump_gallons_day_1);
+    unit_of_measurement: "gal"
+    state_class: measurement
+    accuracy_decimals: 0
+    icon: mdi:history
+    update_interval: ${slow_template_update_interval}
+
+  - platform: template
+    id: water_pump_gallons_7_day
+    name: "Water Pump Gallons 7-Day"
+    lambda: |-
+      return id(water_pump_gallons_day_0) +
+             id(water_pump_gallons_day_1) +
+             id(water_pump_gallons_day_2) +
+             id(water_pump_gallons_day_3) +
+             id(water_pump_gallons_day_4) +
+             id(water_pump_gallons_day_5) +
+             id(water_pump_gallons_day_6);
+    unit_of_measurement: "gal"
+    state_class: measurement
+    accuracy_decimals: 0
+    icon: mdi:calendar-week
+    update_interval: ${slow_template_update_interval}
+
+  - platform: template
+    id: water_pump_turnovers_today
+    name: "Water Pump Turnovers Today"
+    lambda: |-
+      if (id(pool_volume_gallons).state <= 0.0f) {
+        return 0.0f;
+      }
+      return id(water_pump_gallons_day_0) / id(pool_volume_gallons).state;
+    unit_of_measurement: "x"
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: mdi:pool
+    update_interval: ${slow_template_update_interval}
+
+  - platform: template
+    id: water_pump_runtime_yesterday
+    name: "Water Pump Runtime Yesterday"
+    lambda: |-
+      return id(water_pump_runtime_day_1_seconds) / 3600.0f;
+    unit_of_measurement: "h"
+    device_class: duration
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: mdi:history
+    update_interval: ${slow_template_update_interval}
+
+  - platform: template
+    id: water_pump_runtime_7_day
+    name: "Water Pump Runtime 7-Day"
+    lambda: |-
+      const uint32_t runtime_seconds =
+          id(water_pump_runtime_day_0_seconds) +
+          id(water_pump_runtime_day_1_seconds) +
+          id(water_pump_runtime_day_2_seconds) +
+          id(water_pump_runtime_day_3_seconds) +
+          id(water_pump_runtime_day_4_seconds) +
+          id(water_pump_runtime_day_5_seconds) +
+          id(water_pump_runtime_day_6_seconds);
+      return runtime_seconds / 3600.0f;
+    unit_of_measurement: "h"
+    device_class: duration
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: mdi:calendar-week
+    update_interval: ${slow_template_update_interval}
+
+  - platform: template
+    id: water_pump_energy_today
+    name: "Water Pump Energy Today"
+    lambda: |-
+      return id(water_pump_energy_day_0_wh) / 1000.0f;
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: measurement
+    accuracy_decimals: 3
+    icon: mdi:lightning-bolt
+    update_interval: ${slow_template_update_interval}
+
+  - platform: template
+    id: water_pump_energy_yesterday
+    name: "Water Pump Energy Yesterday"
+    lambda: |-
+      return id(water_pump_energy_day_1_wh) / 1000.0f;
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: measurement
+    accuracy_decimals: 3
+    icon: mdi:history
+    update_interval: ${slow_template_update_interval}
+
+  - platform: template
+    id: water_pump_energy_7_day
+    name: "Water Pump Energy 7-Day"
+    lambda: |-
+      const float energy_wh =
+          id(water_pump_energy_day_0_wh) +
+          id(water_pump_energy_day_1_wh) +
+          id(water_pump_energy_day_2_wh) +
+          id(water_pump_energy_day_3_wh) +
+          id(water_pump_energy_day_4_wh) +
+          id(water_pump_energy_day_5_wh) +
+          id(water_pump_energy_day_6_wh);
+      return energy_wh / 1000.0f;
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: measurement
+    accuracy_decimals: 3
+    icon: mdi:calendar-week
+    update_interval: ${slow_template_update_interval}
+
+  - platform: modbus_controller
+    modbus_controller_id: pd140
+    id: water_pump_current_rpm
+    name: "Water Pump RPM Current"
+    address: 0
+    register_type: read
+    value_type: S_WORD
+    unit_of_measurement: "RPM"
+    icon: mdi:fan
+    on_value:
+      then:
+        - lambda: |-
+            id(water_pump_last_telemetry_ms) = millis();
+
+  - platform: modbus_controller
+    modbus_controller_id: pd140
+    id: water_pump_power
+    name: "Water Pump Power"
+    address: 3
+    register_type: read
+    value_type: U_WORD
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    on_value:
+      then:
+        - lambda: |-
+            id(water_pump_last_telemetry_ms) = millis();
+
+  - platform: template
+    id: water_pump_comm_age_seconds
+    name: "Water Pump Communication Age"
+    lambda: |-
+      if (id(water_pump_last_telemetry_ms) == 0) {
+        return ${default_water_pump_comm_stale_seconds};
+      }
+      return (millis() - id(water_pump_last_telemetry_ms)) / 1000.0f;
+    unit_of_measurement: "s"
+    accuracy_decimals: 0
+    icon: mdi:timer-alert-outline
+    entity_category: diagnostic
+    update_interval: ${controller_poll_interval}
+
+  - platform: template
+    id: water_pump_effective_min_rpm
+    name: "Water Pump Effective Minimum RPM"
+    lambda: |-
+      float operating_min_rpm = id(water_pump_operating_min_rpm).state;
+      float operating_max_rpm = id(water_pump_operating_max_rpm).state;
+      if (operating_min_rpm < ${water_pump_min_rpm}) {
+        operating_min_rpm = ${water_pump_min_rpm};
+      }
+      if (operating_max_rpm > ${water_pump_max_rpm}) {
+        operating_max_rpm = ${water_pump_max_rpm};
+      }
+      if (operating_max_rpm < operating_min_rpm) {
+        operating_max_rpm = operating_min_rpm;
+      }
+      float override_min_rpm = id(water_pump_min_rpm_override).state;
+      float override_max_rpm = id(water_pump_max_rpm_override).state;
+      if (override_min_rpm < ${water_pump_min_rpm}) {
+        override_min_rpm = ${water_pump_min_rpm};
+      }
+      if (override_max_rpm > ${water_pump_max_rpm}) {
+        override_max_rpm = ${water_pump_max_rpm};
+      }
+      if (override_max_rpm < override_min_rpm) {
+        override_max_rpm = override_min_rpm;
+      }
+      float effective_min_rpm = id(water_pump_min_rpm_override_active).state ? override_min_rpm : operating_min_rpm;
+      float effective_max_rpm = id(water_pump_max_rpm_override_active).state ? override_max_rpm : operating_max_rpm;
+      if (effective_max_rpm < effective_min_rpm && id(water_pump_max_rpm_override_active).state && !id(water_pump_min_rpm_override_active).state) {
+        effective_min_rpm = effective_max_rpm;
+      }
+      return effective_min_rpm;
+    unit_of_measurement: "RPM"
+    state_class: measurement
+    accuracy_decimals: 0
+    icon: mdi:arrow-expand-up
+    update_interval: ${slow_template_update_interval}
+
+  - platform: template
+    id: water_pump_effective_max_rpm
+    name: "Water Pump Effective Maximum RPM"
+    lambda: |-
+      float operating_min_rpm = id(water_pump_operating_min_rpm).state;
+      float operating_max_rpm = id(water_pump_operating_max_rpm).state;
+      if (operating_min_rpm < ${water_pump_min_rpm}) {
+        operating_min_rpm = ${water_pump_min_rpm};
+      }
+      if (operating_max_rpm > ${water_pump_max_rpm}) {
+        operating_max_rpm = ${water_pump_max_rpm};
+      }
+      if (operating_max_rpm < operating_min_rpm) {
+        operating_max_rpm = operating_min_rpm;
+      }
+      float override_min_rpm = id(water_pump_min_rpm_override).state;
+      float override_max_rpm = id(water_pump_max_rpm_override).state;
+      if (override_min_rpm < ${water_pump_min_rpm}) {
+        override_min_rpm = ${water_pump_min_rpm};
+      }
+      if (override_max_rpm > ${water_pump_max_rpm}) {
+        override_max_rpm = ${water_pump_max_rpm};
+      }
+      if (override_max_rpm < override_min_rpm) {
+        override_max_rpm = override_min_rpm;
+      }
+      float effective_min_rpm = id(water_pump_min_rpm_override_active).state ? override_min_rpm : operating_min_rpm;
+      float effective_max_rpm = id(water_pump_max_rpm_override_active).state ? override_max_rpm : operating_max_rpm;
+      if (effective_max_rpm < effective_min_rpm) {
+        effective_max_rpm = effective_min_rpm;
+      }
+      return effective_max_rpm;
+    unit_of_measurement: "RPM"
+    state_class: measurement
+    accuracy_decimals: 0
+    icon: mdi:arrow-expand-down
+    update_interval: ${slow_template_update_interval}
+
+  - platform: template
+    id: chlorine_pump_runtime_today
+    name: "Chlorine Pump Runtime Today"
+    lambda: |-
+      return id(chlorine_pump_runtime_day_0_seconds) / 3600.0f;
+    unit_of_measurement: "h"
+    device_class: duration
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: mdi:timer-outline
+    update_interval: ${slow_template_update_interval}
+
+  - platform: template
+    id: chlorine_pump_runtime_yesterday
+    name: "Chlorine Pump Runtime Yesterday"
+    lambda: |-
+      return id(chlorine_pump_runtime_day_1_seconds) / 3600.0f;
+    unit_of_measurement: "h"
+    device_class: duration
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: mdi:history
+    update_interval: ${slow_template_update_interval}
+
+  - platform: template
+    id: chlorine_pump_runtime_7_day
+    name: "Chlorine Pump Runtime 7-Day"
+    lambda: |-
+      const uint32_t runtime_seconds =
+          id(chlorine_pump_runtime_day_0_seconds) +
+          id(chlorine_pump_runtime_day_1_seconds) +
+          id(chlorine_pump_runtime_day_2_seconds) +
+          id(chlorine_pump_runtime_day_3_seconds) +
+          id(chlorine_pump_runtime_day_4_seconds) +
+          id(chlorine_pump_runtime_day_5_seconds) +
+          id(chlorine_pump_runtime_day_6_seconds);
+      return runtime_seconds / 3600.0f;
+    unit_of_measurement: "h"
+    device_class: duration
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: mdi:calendar-week
+    update_interval: ${slow_template_update_interval}
+
+  - platform: template
+    id: chlorine_pump_oz_delivered_today
+    name: "Chlorine Pump Ounces Delivered Today"
+    lambda: |-
+      return id(chlorine_pump_oz_day_0);
+    unit_of_measurement: "oz"
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: mdi:flask
+    update_interval: ${slow_template_update_interval}
+
+  - platform: template
+    id: chlorine_pump_oz_delivered_yesterday
+    name: "Chlorine Pump Ounces Delivered Yesterday"
+    lambda: |-
+      return id(chlorine_pump_oz_day_1);
+    unit_of_measurement: "oz"
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: mdi:history
+    update_interval: ${slow_template_update_interval}
+
+  - platform: template
+    id: chlorine_pump_oz_delivered_7_day
+    name: "Chlorine Pump Ounces Delivered 7-Day"
+    lambda: |-
+      const float oz_delivered =
+          id(chlorine_pump_oz_day_0) +
+          id(chlorine_pump_oz_day_1) +
+          id(chlorine_pump_oz_day_2) +
+          id(chlorine_pump_oz_day_3) +
+          id(chlorine_pump_oz_day_4) +
+          id(chlorine_pump_oz_day_5) +
+          id(chlorine_pump_oz_day_6);
+      return oz_delivered;
+    unit_of_measurement: "oz"
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: mdi:calendar-week
+    update_interval: ${slow_template_update_interval}
+
+  - platform: template
+    id: chlorine_pump_dose_requested_runtime_minutes
+    name: "Chlorine Pump Dose Requested Runtime (Oz Request)"
+    lambda: |-
+      const float oz_per_min = id(chlorine_pump_oz_per_min).state;
+      if (oz_per_min <= 0.0f) {
+        return 0.0f;
+      }
+      return id(chlorine_pump_dose_request_oz).state / oz_per_min;
+    unit_of_measurement: "min"
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: mdi:timer-play-outline
+    update_interval: ${slow_template_update_interval}
+
+  - platform: template
+    id: chlorine_pump_last_executed_dose_oz_sensor
+    name: "Chlorine Pump Dose Last Executed Oz"
+    lambda: |-
+      return id(chlorine_pump_last_executed_oz);
+    unit_of_measurement: "oz"
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: mdi:history
+    update_interval: ${slow_template_update_interval}
+
+  - platform: template
+    id: chlorine_pump_last_executed_dose_ppm_sensor
+    name: "Chlorine Pump Dose Last Executed PPM"
+    lambda: |-
+      return id(chlorine_pump_last_executed_ppm);
+    unit_of_measurement: "ppm"
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: mdi:history
+    update_interval: ${slow_template_update_interval}
+
+  - platform: template
+    id: chlorine_pump_last_completed_runtime_seconds_sensor
+    name: "Chlorine Pump Dose Last Completed Runtime"
+    lambda: |-
+      return id(chlorine_pump_last_completed_runtime_seconds);
+    unit_of_measurement: "s"
+    state_class: measurement
+    accuracy_decimals: 0
+    icon: mdi:history
+    update_interval: ${slow_template_update_interval}
+
+  - platform: template
+    id: chlorine_pump_dose_remaining_seconds_sensor
+    name: "Chlorine Pump Dose Remaining Seconds"
+    lambda: |-
+      return std::max(0.0f, id(chlorine_pump_dose_runtime_seconds_pending));
+    unit_of_measurement: "s"
+    state_class: measurement
+    accuracy_decimals: 0
+    icon: mdi:timer-sand
+    update_interval: ${controller_poll_interval}
+
+  - platform: template
+    id: chlorine_pump_dose_remaining_oz_sensor
+    name: "Chlorine Pump Dose Remaining Oz"
+    lambda: |-
+      const float oz_per_min = id(chlorine_pump_oz_per_min).state;
+      if (oz_per_min <= 0.0f) {
+        return 0.0f;
+      }
+      return std::max(0.0f, id(chlorine_pump_dose_runtime_seconds_pending)) * oz_per_min / 60.0f;
+    unit_of_measurement: "oz"
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: mdi:timer-sand
+    update_interval: ${controller_poll_interval}
+
+  - platform: template
+    id: chlorine_pump_dose_remaining_ppm_sensor
+    name: "Chlorine Pump Dose Remaining PPM"
+    lambda: |-
+      const float oz_per_min = id(chlorine_pump_oz_per_min).state;
+      const float pool_volume = id(pool_volume_gallons).state;
+      const float chlorine_strength = id(chlorine_pump_liquid_strength_percent).state;
+      if (oz_per_min <= 0.0f || pool_volume <= 0.0f || chlorine_strength <= 0.0f) {
+        return 0.0f;
+      }
+      const float remaining_oz = std::max(0.0f, id(chlorine_pump_dose_runtime_seconds_pending)) * oz_per_min / 60.0f;
+      return remaining_oz * chlorine_strength * 10000.0f / (128.0f * pool_volume);
+    unit_of_measurement: "ppm"
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: mdi:timer-sand
+    update_interval: ${controller_poll_interval}
+
+  - platform: template
+    id: chlorine_pump_power
+    name: "Chlorine Pump Power"
+    lambda: |-
+      return id(relay1).state ? id(chlorine_pump_power_watts).state : 0.0f;
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: mdi:lightning-bolt
+    update_interval: ${controller_poll_interval}
+
+  - platform: template
+    id: chlorine_pump_energy_today
+    name: "Chlorine Pump Energy Today"
+    lambda: |-
+      return id(chlorine_pump_energy_day_0_wh) / 1000.0f;
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: measurement
+    accuracy_decimals: 3
+    icon: mdi:lightning-bolt
+    update_interval: ${slow_template_update_interval}
+
+  - platform: template
+    id: chlorine_pump_energy_yesterday
+    name: "Chlorine Pump Energy Yesterday"
+    lambda: |-
+      return id(chlorine_pump_energy_day_1_wh) / 1000.0f;
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: measurement
+    accuracy_decimals: 3
+    icon: mdi:history
+    update_interval: ${slow_template_update_interval}
+
+  - platform: template
+    id: chlorine_pump_energy_7_day
+    name: "Chlorine Pump Energy 7-Day"
+    lambda: |-
+      const float energy_wh =
+          id(chlorine_pump_energy_day_0_wh) +
+          id(chlorine_pump_energy_day_1_wh) +
+          id(chlorine_pump_energy_day_2_wh) +
+          id(chlorine_pump_energy_day_3_wh) +
+          id(chlorine_pump_energy_day_4_wh) +
+          id(chlorine_pump_energy_day_5_wh) +
+          id(chlorine_pump_energy_day_6_wh);
+      return energy_wh / 1000.0f;
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: measurement
+    accuracy_decimals: 3
+    icon: mdi:calendar-week
+    update_interval: ${slow_template_update_interval}
+
+  - platform: template
+    id: chlorine_pump_ppm_increase_today
+    name: "Chlorine Pump PPM Increase Today"
+    lambda: |-
+      return id(chlorine_pump_ppm_day_0);
+    unit_of_measurement: "ppm"
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: mdi:flask
+    update_interval: ${slow_template_update_interval}
+
+  - platform: template
+    id: chlorine_pump_ppm_increase_yesterday
+    name: "Chlorine Pump PPM Increase Yesterday"
+    lambda: |-
+      return id(chlorine_pump_ppm_day_1);
+    unit_of_measurement: "ppm"
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: mdi:history
+    update_interval: ${slow_template_update_interval}
+
+  - platform: template
+    id: chlorine_pump_ppm_increase_7_day
+    name: "Chlorine Pump PPM Increase 7-Day"
+    lambda: |-
+      return id(chlorine_pump_ppm_day_0) +
+             id(chlorine_pump_ppm_day_1) +
+             id(chlorine_pump_ppm_day_2) +
+             id(chlorine_pump_ppm_day_3) +
+             id(chlorine_pump_ppm_day_4) +
+             id(chlorine_pump_ppm_day_5) +
+             id(chlorine_pump_ppm_day_6);
+    unit_of_measurement: "ppm"
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: mdi:calendar-week
+    update_interval: ${slow_template_update_interval}
+
+  - platform: template
+    id: chlorine_pump_tank_remaining_percent_sensor
+    name: "Chlorine Pump Tank Remaining"
+    lambda: |-
+      const float tank_capacity = id(chlorine_pump_tank_capacity_oz).state;
+      if (tank_capacity <= 0.0f) {
+        return 0.0f;
+      }
+      return std::max(0.0f, id(chlorine_pump_tank_level_oz).state) * 100.0f / tank_capacity;
+    unit_of_measurement: "%"
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: mdi:gauge
+    update_interval: ${slow_template_update_interval}
+
+# --------------------------------------------------------
+# EXPOSED WRITE INTERFACES FOR MOTOR CONTROL
+# --------------------------------------------------------
+# Public pump controls expose intent and guardrails.
+# The raw Modbus write entities stay internal so the public model remains easy to follow.
+
+number:
+  - platform: template
+    id: pool_volume_gallons
+    name: "Pool Volume Gallons"
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    initial_value: ${default_pool_volume_gallons}
+    min_value: 1000
+    max_value: 100000
+    step: 100
+    unit_of_measurement: "gal"
+    mode: box
+    set_action:
+      - lambda: |-
+          id(pool_volume_gallons).publish_state(x);
+          const float chlorine_strength = id(chlorine_pump_liquid_strength_percent).state;
+          float requested_ppm = 0.0f;
+          if (x > 0.0f && chlorine_strength > 0.0f) {
+            requested_ppm = id(chlorine_pump_dose_request_oz).state * chlorine_strength * 10000.0f / (128.0f * x);
+          }
+          id(chlorine_pump_dose_request_ppm).publish_state(requested_ppm);
+          esphome::global_preferences->sync();
+
+  - platform: template
+    id: chlorine_pump_oz_per_min
+    name: "Chlorine Pump Ounces Per Minute"
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    initial_value: ${default_chlorine_pump_oz_per_min}
+    min_value: 0.1
+    max_value: 5.0
+    step: 0.001
+    unit_of_measurement: "oz/min"
+    mode: box
+    set_action:
+      - lambda: |-
+          id(chlorine_pump_oz_per_min).publish_state(x);
+          esphome::global_preferences->sync();
+
+  - platform: template
+    id: chlorine_pump_liquid_strength_percent
+    name: "Chlorine Pump Liquid Strength"
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    initial_value: ${default_chlorine_pump_liquid_strength_percent}
+    min_value: 1.0
+    max_value: 15.0
+    step: 0.1
+    unit_of_measurement: "%"
+    mode: box
+    set_action:
+      - lambda: |-
+          id(chlorine_pump_liquid_strength_percent).publish_state(x);
+          const float pool_volume = id(pool_volume_gallons).state;
+          float requested_ppm = 0.0f;
+          if (pool_volume > 0.0f && x > 0.0f) {
+            requested_ppm = id(chlorine_pump_dose_request_oz).state * x * 10000.0f / (128.0f * pool_volume);
+          }
+          id(chlorine_pump_dose_request_ppm).publish_state(requested_ppm);
+          esphome::global_preferences->sync();
+
+  - platform: template
+    id: chlorine_pump_dose_request_oz
+    name: "Chlorine Pump Dose Request Oz"
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    initial_value: ${default_chlorine_pump_dose_request_oz}
+    min_value: 0.1
+    max_value: 128
+    step: 0.1
+    unit_of_measurement: "oz"
+    mode: box
+    set_action:
+      - lambda: |-
+          id(chlorine_pump_dose_request_oz).publish_state(x);
+          const float pool_volume = id(pool_volume_gallons).state;
+          const float chlorine_strength = id(chlorine_pump_liquid_strength_percent).state;
+          float requested_ppm = 0.0f;
+          if (pool_volume > 0.0f && chlorine_strength > 0.0f) {
+            requested_ppm = x * chlorine_strength * 10000.0f / (128.0f * pool_volume);
+          }
+          id(chlorine_pump_dose_request_ppm).publish_state(requested_ppm);
+          id(chlorine_pump_blocked_reason_state) = "idle";
+          id(chlorine_pump_dose_blocked_reason).publish_state(id(chlorine_pump_blocked_reason_state));
+          esphome::global_preferences->sync();
+
+  - platform: template
+    id: chlorine_pump_dose_request_ppm
+    name: "Chlorine Pump Dose Request PPM"
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    initial_value: 0.0
+    min_value: 0.1
+    max_value: 12.0
+    step: 0.1
+    unit_of_measurement: "ppm"
+    mode: box
+    set_action:
+      - lambda: |-
+          const float pool_volume = id(pool_volume_gallons).state;
+          const float chlorine_strength = id(chlorine_pump_liquid_strength_percent).state;
+          if (pool_volume <= 0.0f || chlorine_strength <= 0.0f) {
+            id(chlorine_pump_dose_request_ppm).publish_state(0.0f);
+            id(chlorine_pump_dose_request_oz).publish_state(0.0f);
+            id(chlorine_pump_blocked_reason_state) = "invalid_chemistry_config";
+            id(chlorine_pump_dose_blocked_reason).publish_state(id(chlorine_pump_blocked_reason_state));
+            esphome::global_preferences->sync();
+            return;
+          }
+
+          const float requested_oz = x * 128.0f * pool_volume / (chlorine_strength * 10000.0f);
+          id(chlorine_pump_dose_request_ppm).publish_state(x);
+          id(chlorine_pump_dose_request_oz).publish_state(requested_oz);
+          id(chlorine_pump_blocked_reason_state) = "idle";
+          id(chlorine_pump_dose_blocked_reason).publish_state(id(chlorine_pump_blocked_reason_state));
+          esphome::global_preferences->sync();
+
+  - platform: template
+    id: chlorine_pump_max_single_dose_oz
+    name: "Chlorine Pump Dose Maximum Single Oz"
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    initial_value: ${default_chlorine_pump_max_single_dose_oz}
+    min_value: 1
+    max_value: 256
+    step: 0.1
+    unit_of_measurement: "oz"
+    mode: box
+    set_action:
+      - lambda: |-
+          id(chlorine_pump_max_single_dose_oz).publish_state(x);
+          esphome::global_preferences->sync();
+
+  - platform: template
+    id: chlorine_pump_max_daily_dose_ppm
+    name: "Chlorine Pump Dose Maximum Daily PPM"
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    initial_value: ${default_chlorine_pump_max_daily_dose_ppm}
+    min_value: 0.1
+    max_value: 20.0
+    step: 0.1
+    unit_of_measurement: "ppm"
+    mode: box
+    set_action:
+      - lambda: |-
+          id(chlorine_pump_max_daily_dose_ppm).publish_state(x);
+          esphome::global_preferences->sync();
+
+  - platform: template
+    id: chlorine_pump_pre_run_seconds
+    name: "Chlorine Pump Dose Pre-Run Seconds"
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    initial_value: ${default_chlorine_pump_pre_run_seconds}
+    min_value: 0
+    max_value: 1800
+    step: 5
+    unit_of_measurement: "s"
+    mode: box
+    set_action:
+      - lambda: |-
+          id(chlorine_pump_pre_run_seconds).publish_state(x);
+          esphome::global_preferences->sync();
+
+  - platform: template
+    id: chlorine_pump_post_run_seconds
+    name: "Chlorine Pump Dose Post-Run Seconds"
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    initial_value: ${default_chlorine_pump_post_run_seconds}
+    min_value: 0
+    max_value: 3600
+    step: 5
+    unit_of_measurement: "s"
+    mode: box
+    set_action:
+      - lambda: |-
+          id(chlorine_pump_post_run_seconds).publish_state(x);
+          esphome::global_preferences->sync();
+
+  - platform: template
+    id: chlorine_pump_minimum_rest_seconds
+    name: "Chlorine Pump Dose Minimum Rest Seconds"
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    initial_value: ${default_chlorine_pump_minimum_rest_seconds}
+    min_value: 0
+    max_value: 43200
+    step: 30
+    unit_of_measurement: "s"
+    mode: box
+    set_action:
+      - lambda: |-
+          id(chlorine_pump_minimum_rest_seconds).publish_state(x);
+          esphome::global_preferences->sync();
+
+  - platform: template
+    id: chlorine_pump_tank_capacity_oz
+    name: "Chlorine Pump Tank Capacity"
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    initial_value: ${default_chlorine_pump_tank_capacity_oz}
+    min_value: 0
+    max_value: 4096
+    step: 1
+    unit_of_measurement: "oz"
+    mode: box
+    set_action:
+      - lambda: |-
+          float tank_capacity = std::max(0.0f, x);
+          id(chlorine_pump_tank_capacity_oz).publish_state(tank_capacity);
+          if (id(chlorine_pump_tank_level_oz).state > tank_capacity) {
+            id(chlorine_pump_tank_level_oz).publish_state(tank_capacity);
+          }
+          if (id(chlorine_pump_tank_low_threshold_oz).state > tank_capacity) {
+            id(chlorine_pump_tank_low_threshold_oz).publish_state(tank_capacity);
+          }
+          esphome::global_preferences->sync();
+
+  - platform: template
+    id: chlorine_pump_tank_level_oz
+    name: "Chlorine Pump Tank Level"
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    initial_value: ${default_chlorine_pump_tank_level_oz}
+    min_value: 0
+    max_value: 4096
+    step: 1
+    unit_of_measurement: "oz"
+    mode: box
+    set_action:
+      - lambda: |-
+          float tank_level = x;
+          if (tank_level < 0.0f) {
+            tank_level = 0.0f;
+          }
+          if (tank_level > id(chlorine_pump_tank_capacity_oz).state) {
+            tank_level = id(chlorine_pump_tank_capacity_oz).state;
+          }
+          id(chlorine_pump_tank_level_oz).publish_state(tank_level);
+          esphome::global_preferences->sync();
+
+  - platform: template
+    id: chlorine_pump_tank_low_threshold_oz
+    name: "Chlorine Pump Tank Low Threshold"
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    initial_value: ${default_chlorine_pump_tank_low_threshold_oz}
+    min_value: 0
+    max_value: 4096
+    step: 1
+    unit_of_measurement: "oz"
+    mode: box
+    set_action:
+      - lambda: |-
+          float tank_low_threshold = x;
+          if (tank_low_threshold < 0.0f) {
+            tank_low_threshold = 0.0f;
+          }
+          if (tank_low_threshold > id(chlorine_pump_tank_capacity_oz).state) {
+            tank_low_threshold = id(chlorine_pump_tank_capacity_oz).state;
+          }
+          id(chlorine_pump_tank_low_threshold_oz).publish_state(tank_low_threshold);
+          esphome::global_preferences->sync();
+
+  - platform: template
+    id: chlorine_pump_power_watts
+    name: "Chlorine Pump Power Estimate"
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    initial_value: ${default_chlorine_pump_power_watts}
+    min_value: 1
+    max_value: 1500
+    step: 1
+    unit_of_measurement: "W"
+    mode: box
+    set_action:
+      - lambda: |-
+          id(chlorine_pump_power_watts).publish_state(x);
+          esphome::global_preferences->sync();
+
+  - platform: template
+    id: water_pump_operating_min_rpm
+    name: "Water Pump Operating Minimum RPM"
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    initial_value: ${water_pump_min_rpm}
+    min_value: ${water_pump_min_rpm}
+    max_value: ${water_pump_max_rpm}
+    step: 10
+    unit_of_measurement: "RPM"
+    mode: box
+    set_action:
+      - lambda: |-
+          float clamped_min_rpm = x;
+          const float current_max_rpm = id(water_pump_operating_max_rpm).state;
+          if (clamped_min_rpm > current_max_rpm) {
+            clamped_min_rpm = current_max_rpm;
+          }
+          id(water_pump_operating_min_rpm).publish_state(clamped_min_rpm);
+      - script.execute: apply_water_pump_rpm_request
+
+  - platform: template
+    id: water_pump_operating_max_rpm
+    name: "Water Pump Operating Maximum RPM"
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    initial_value: ${water_pump_max_rpm}
+    min_value: ${water_pump_min_rpm}
+    max_value: ${water_pump_max_rpm}
+    step: 10
+    unit_of_measurement: "RPM"
+    mode: box
+    set_action:
+      - lambda: |-
+          float clamped_max_rpm = x;
+          const float current_min_rpm = id(water_pump_operating_min_rpm).state;
+          if (clamped_max_rpm < current_min_rpm) {
+            clamped_max_rpm = current_min_rpm;
+          }
+          id(water_pump_operating_max_rpm).publish_state(clamped_max_rpm);
+      - script.execute: apply_water_pump_rpm_request
+
+  # Override values define an alternate temporary operating window.
+  # They do nothing until the corresponding override enable switch is turned on.
+  - platform: template
+    id: water_pump_min_rpm_override
+    name: "Water Pump Minimum RPM Override"
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    initial_value: ${water_pump_min_rpm}
+    min_value: ${water_pump_min_rpm}
+    max_value: ${water_pump_max_rpm}
+    step: 10
+    unit_of_measurement: "RPM"
+    mode: box
+    set_action:
+      - lambda: |-
+          float clamped_min_rpm = x;
+          const float current_max_rpm = id(water_pump_max_rpm_override).state;
+          if (clamped_min_rpm > current_max_rpm) {
+            clamped_min_rpm = current_max_rpm;
+          }
+          id(water_pump_min_rpm_override).publish_state(clamped_min_rpm);
+      - script.execute: apply_water_pump_rpm_request
+
+  - platform: template
+    id: water_pump_max_rpm_override
+    name: "Water Pump Maximum RPM Override"
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    initial_value: ${water_pump_max_rpm}
+    min_value: ${water_pump_min_rpm}
+    max_value: ${water_pump_max_rpm}
+    step: 10
+    unit_of_measurement: "RPM"
+    mode: box
+    set_action:
+      - lambda: |-
+          float clamped_max_rpm = x;
+          const float current_min_rpm = id(water_pump_min_rpm_override).state;
+          if (clamped_max_rpm < current_min_rpm) {
+            clamped_max_rpm = current_min_rpm;
+          }
+          id(water_pump_max_rpm_override).publish_state(clamped_max_rpm);
+      - script.execute: apply_water_pump_rpm_request
+
+  # Target override forces a temporary specific request without changing the
+  # underlying normal target, so disabling it resumes the prior requested RPM.
+  - platform: template
+    id: water_pump_target_rpm_override
+    name: "Water Pump Target RPM Override"
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    initial_value: ${water_pump_min_rpm}
+    min_value: ${water_pump_min_rpm}
+    max_value: ${water_pump_max_rpm}
+    step: 10
+    unit_of_measurement: "RPM"
+    mode: box
+    set_action:
+      - lambda: |-
+          float requested_rpm = x;
+          if (requested_rpm < ${water_pump_min_rpm}) {
+            requested_rpm = ${water_pump_min_rpm};
+          }
+          if (requested_rpm > ${water_pump_max_rpm}) {
+            requested_rpm = ${water_pump_max_rpm};
+          }
+            id(water_pump_target_rpm_override).publish_state(requested_rpm);
+      - script.execute: apply_water_pump_rpm_request
+
+  - platform: modbus_controller
+    modbus_controller_id: pd140
+    id: water_pump_switch_command
+    name: "Water Pump Enable"
+    internal: true
+    address: 0
+    register_type: holding
+    value_type: U_WORD
+    min_value: 0
+    max_value: 1
+    step: 1
+    force_new_range: true
+    disabled_by_default: true
+    on_value:
+      then:
+        - lambda: |-
+            esphome::global_preferences->sync();
+
+  - platform: modbus_controller
+    modbus_controller_id: pd140
+    id: water_pump_rpm_command
+    name: "Water Pump RPM Command"
+    internal: true
+    address: 1
+    register_type: holding
+    value_type: U_WORD
+    min_value: ${water_pump_min_rpm}
+    max_value: ${water_pump_max_rpm}
+    step: 10
+    force_new_range: true
+    on_value:
+      then:
+        - lambda: |-
+            esphome::global_preferences->sync();
+
+  - platform: template
+    id: water_pump_rpm_target_request
+    name: "Water Pump RPM Target"
+    optimistic: true
+    restore_value: true
+    initial_value: ${water_pump_min_rpm}
+    min_value: ${water_pump_min_rpm}
+    max_value: ${water_pump_max_rpm}
+    step: 10
+    unit_of_measurement: "RPM"
+    mode: box
+    set_action:
+      - lambda: |-
+          float requested_rpm = x;
+          if (requested_rpm < ${water_pump_min_rpm}) {
+            requested_rpm = ${water_pump_min_rpm};
+          }
+          if (requested_rpm > ${water_pump_max_rpm}) {
+            requested_rpm = ${water_pump_max_rpm};
+          }
+          id(water_pump_rpm_target_request).publish_state(requested_rpm);
+      - script.execute: apply_water_pump_rpm_request
+
+  # Flow-percent target is intentionally excluded from this configuration.
+  # RPM remains the single public water_pump control surface so override and
+  # clamp semantics stay consistent and reversible.
+
+# --------------------------------------------------------
+# SYSTEM INTEGRATION & RELAYS
+# --------------------------------------------------------
+
+binary_sensor:
+  - platform: template
+    id: water_pump_comm_healthy
+    name: "Water Pump Communication Healthy"
+    device_class: connectivity
+    entity_category: diagnostic
+    lambda: |-
+      return id(water_pump_last_telemetry_ms) > 0 && (millis() - id(water_pump_last_telemetry_ms)) <= (${default_water_pump_comm_stale_seconds} * 1000UL);
+
+  - platform: template
+    id: water_pump_running_confirmed
+    name: "Water Pump Running Confirmed"
+    device_class: running
+    lambda: |-
+      if (!id(water_pump_comm_healthy).state) {
+        return false;
+      }
+      return id(water_pump_current_rpm).state >= ${water_pump_running_min_rpm} || id(water_pump_power).state >= ${water_pump_running_min_watts};
+
+  - platform: template
+    id: water_pump_rpm_override_active
+    name: "Water Pump RPM Override Active"
+    lambda: |-
+      const bool min_override_active = id(water_pump_min_rpm_override_active).state && fabsf(id(water_pump_min_rpm_override).state - id(water_pump_operating_min_rpm).state) >= 1.0f;
+      const bool max_override_active = id(water_pump_max_rpm_override_active).state && fabsf(id(water_pump_max_rpm_override).state - id(water_pump_operating_max_rpm).state) >= 1.0f;
+      const bool target_override_active = id(water_pump_target_rpm_override_active).state && fabsf(id(water_pump_target_rpm_override).state - id(water_pump_rpm_target_request).state) >= 1.0f;
+      return min_override_active || max_override_active || target_override_active;
+
+  - platform: template
+    id: chlorine_pump_dose_active
+    name: "Chlorine Pump Dose Active"
+    device_class: running
+    lambda: |-
+      return id(chlorine_pump_dose_active_state);
+
+  - platform: template
+    id: chlorine_pump_tank_low
+    name: "Chlorine Pump Tank Low"
+    device_class: problem
+    lambda: |-
+      return id(chlorine_pump_tank_level_oz).state <= id(chlorine_pump_tank_low_threshold_oz).state;
+
+  - platform: status
+    name: "Status"
+
+  - platform: gpio
+    name: "Boot Button"
+    pin:
+      number: 0
+      ignore_strapping_warning: true
+      mode:
+        input: true
+      inverted: true
+    disabled_by_default: true
+    on_press:
+      then:
+        - button.press: restart_button
+
+switch:
+  - platform: template
+    id: water_pump
+    name: "Water Pump"
+    icon: mdi:pump
+    optimistic: true
+    lambda: |-
+      return id(water_pump_switch_command).state > 0.0f;
+    turn_on_action:
+      - number.set:
+          id: water_pump_switch_command
+          value: 1
+      - lambda: |-
+          esphome::global_preferences->sync();
+    turn_off_action:
+      - if:
+          condition:
+            lambda: |-
+              return id(chlorine_pump_dose_active_state);
+          then:
+            - lambda: |-
+                id(chlorine_pump_blocked_reason_state) = "dose_aborted_water_pump_off";
+            - script.execute: stop_active_chlorine_pump_dose
+      - number.set:
+          id: water_pump_switch_command
+          value: 0
+      - lambda: |-
+          esphome::global_preferences->sync();
+
+  - platform: template
+    id: chlorine_pump_dose_lockout
+    name: "Chlorine Pump Dose Lockout"
+    entity_category: config
+    optimistic: true
+    lambda: |-
+      return id(chlorine_pump_dose_lockout_state);
+    turn_on_action:
+      - lambda: |-
+          id(chlorine_pump_dose_lockout_state) = true;
+          esphome::global_preferences->sync();
+    turn_off_action:
+      - lambda: |-
+          id(chlorine_pump_dose_lockout_state) = false;
+          esphome::global_preferences->sync();
+
+  - platform: template
+    id: water_pump_min_rpm_override_active
+    name: "Water Pump Minimum RPM Override Active"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    lambda: |-
+      return id(water_pump_min_rpm_override_active).state;
+    turn_on_action:
+      - switch.template.publish:
+          id: water_pump_min_rpm_override_active
+          state: true
+      - script.execute: apply_water_pump_rpm_request
+    turn_off_action:
+      - switch.template.publish:
+          id: water_pump_min_rpm_override_active
+          state: false
+      - script.execute: apply_water_pump_rpm_request
+
+  - platform: template
+    id: water_pump_max_rpm_override_active
+    name: "Water Pump Maximum RPM Override Active"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    lambda: |-
+      return id(water_pump_max_rpm_override_active).state;
+    turn_on_action:
+      - switch.template.publish:
+          id: water_pump_max_rpm_override_active
+          state: true
+      - script.execute: apply_water_pump_rpm_request
+    turn_off_action:
+      - switch.template.publish:
+          id: water_pump_max_rpm_override_active
+          state: false
+      - script.execute: apply_water_pump_rpm_request
+
+  - platform: template
+    id: water_pump_target_rpm_override_active
+    name: "Water Pump Target RPM Override Active"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    lambda: |-
+      return id(water_pump_target_rpm_override_active).state;
+    turn_on_action:
+      - switch.template.publish:
+          id: water_pump_target_rpm_override_active
+          state: true
+      - script.execute: apply_water_pump_rpm_request
+    turn_off_action:
+      - switch.template.publish:
+          id: water_pump_target_rpm_override_active
+          state: false
+      - script.execute: apply_water_pump_rpm_request
+
+  - platform: gpio
+    pin: ${relay_1_pin}
+    id: relay1
+    name: "${relay_1_name}"
+    internal: true
+  - platform: gpio
+    pin: ${relay_2_pin}
+    id: relay2
+    name: "${relay_2_name}"
+  - platform: gpio
+    pin: ${relay_3_pin}
+    id: relay3
+    name: "${relay_3_name}"
+  - platform: gpio
+    pin: ${relay_4_pin}
+    id: relay4
+    name: "${relay_4_name}"
+  - platform: gpio
+    pin:
+      number: ${relay_5_pin}
+      ignore_strapping_warning: true
+    id: relay5
+    name: "${relay_5_name}"
+  - platform: gpio
+    pin:
+      number: ${relay_6_pin}
+      ignore_strapping_warning: true
+    id: relay6
+    name: "${relay_6_name}"
+
+script:
+  - id: apply_water_pump_rpm_request
+    mode: restart
+    then:
+      - lambda: |-
+          float operating_min_rpm = id(water_pump_operating_min_rpm).state;
+          float operating_max_rpm = id(water_pump_operating_max_rpm).state;
+          if (operating_min_rpm < ${water_pump_min_rpm}) {
+            operating_min_rpm = ${water_pump_min_rpm};
+          }
+          if (operating_max_rpm > ${water_pump_max_rpm}) {
+            operating_max_rpm = ${water_pump_max_rpm};
+          }
+          if (operating_max_rpm < operating_min_rpm) {
+            operating_max_rpm = operating_min_rpm;
+          }
+          float override_min_rpm = id(water_pump_min_rpm_override).state;
+          float override_max_rpm = id(water_pump_max_rpm_override).state;
+          if (override_min_rpm < ${water_pump_min_rpm}) {
+            override_min_rpm = ${water_pump_min_rpm};
+          }
+          if (override_max_rpm > ${water_pump_max_rpm}) {
+            override_max_rpm = ${water_pump_max_rpm};
+          }
+          if (override_max_rpm < override_min_rpm) {
+            override_max_rpm = override_min_rpm;
+          }
+          float effective_min_rpm = id(water_pump_min_rpm_override_active).state ? override_min_rpm : operating_min_rpm;
+          float effective_max_rpm = id(water_pump_max_rpm_override_active).state ? override_max_rpm : operating_max_rpm;
+          if (effective_max_rpm < effective_min_rpm) {
+            if (id(water_pump_max_rpm_override_active).state && !id(water_pump_min_rpm_override_active).state) {
+              effective_min_rpm = effective_max_rpm;
+            } else {
+              effective_max_rpm = effective_min_rpm;
+            }
+          }
+          float requested_rpm = id(water_pump_rpm_target_request).state;
+          if (id(water_pump_target_rpm_override_active).state) {
+            requested_rpm = id(water_pump_target_rpm_override).state;
+          }
+          if (requested_rpm < ${water_pump_min_rpm}) {
+            requested_rpm = ${water_pump_min_rpm};
+          }
+          if (requested_rpm > ${water_pump_max_rpm}) {
+            requested_rpm = ${water_pump_max_rpm};
+          }
+      - number.set:
+          id: water_pump_rpm_command
+          value: !lambda |-
+            float operating_min_rpm = id(water_pump_operating_min_rpm).state;
+            float operating_max_rpm = id(water_pump_operating_max_rpm).state;
+            if (operating_min_rpm < ${water_pump_min_rpm}) {
+              operating_min_rpm = ${water_pump_min_rpm};
+            }
+            if (operating_max_rpm > ${water_pump_max_rpm}) {
+              operating_max_rpm = ${water_pump_max_rpm};
+            }
+            if (operating_max_rpm < operating_min_rpm) {
+              operating_max_rpm = operating_min_rpm;
+            }
+            float override_min_rpm = id(water_pump_min_rpm_override).state;
+            float override_max_rpm = id(water_pump_max_rpm_override).state;
+            if (override_min_rpm < ${water_pump_min_rpm}) {
+              override_min_rpm = ${water_pump_min_rpm};
+            }
+            if (override_max_rpm > ${water_pump_max_rpm}) {
+              override_max_rpm = ${water_pump_max_rpm};
+            }
+            if (override_max_rpm < override_min_rpm) {
+              override_max_rpm = override_min_rpm;
+            }
+            float effective_min_rpm = id(water_pump_min_rpm_override_active).state ? override_min_rpm : operating_min_rpm;
+            float effective_max_rpm = id(water_pump_max_rpm_override_active).state ? override_max_rpm : operating_max_rpm;
+            if (effective_max_rpm < effective_min_rpm) {
+              if (id(water_pump_max_rpm_override_active).state && !id(water_pump_min_rpm_override_active).state) {
+                effective_min_rpm = effective_max_rpm;
+              } else {
+                effective_max_rpm = effective_min_rpm;
+              }
+            }
+            float requested_rpm = id(water_pump_rpm_target_request).state;
+            const bool target_rpm_override_active = id(water_pump_target_rpm_override_active).state;
+            if (target_rpm_override_active) {
+              requested_rpm = id(water_pump_target_rpm_override).state;
+            }
+            if (requested_rpm < ${water_pump_min_rpm}) {
+              requested_rpm = ${water_pump_min_rpm};
+            }
+            if (requested_rpm > ${water_pump_max_rpm}) {
+              requested_rpm = ${water_pump_max_rpm};
+            }
+            float commanded_rpm = requested_rpm;
+            if (!target_rpm_override_active) {
+              if (commanded_rpm < effective_min_rpm) {
+                commanded_rpm = effective_min_rpm;
+              }
+              if (commanded_rpm > effective_max_rpm) {
+                commanded_rpm = effective_max_rpm;
+              }
+            }
+            return commanded_rpm;
+      - lambda: |-
+          esphome::global_preferences->sync();
+
+  - id: stop_active_chlorine_pump_dose
+    mode: restart
+    then:
+      - script.stop: execute_requested_chlorine_pump_dose
+      - lambda: |-
+          id(chlorine_pump_dose_active_state) = false;
+          id(chlorine_pump_dose_runtime_seconds_pending) = 0.0f;
+          id(chlorine_pump_dose_total_runtime_seconds_requested) = 0.0f;
+          id(chlorine_pump_dose_active).publish_state(false);
+      - if:
+          condition:
+            switch.is_on: relay1
+          then:
+            - switch.turn_off: relay1
+      - if:
+          condition:
+            lambda: |-
+              return id(chlorine_pump_started_water_pump_by_controller);
+          then:
+            - switch.turn_off: water_pump
+      - lambda: |-
+          id(chlorine_pump_started_water_pump_by_controller) = false;
+          id(chlorine_pump_dose_blocked_reason).publish_state(id(chlorine_pump_blocked_reason_state));
+
+  - id: execute_requested_chlorine_pump_dose
+    mode: single
+    then:
+      - lambda: |-
+          const float requested_oz = id(chlorine_pump_dose_request_oz).state;
+          const float oz_per_min = id(chlorine_pump_oz_per_min).state;
+          const float max_single_dose = id(chlorine_pump_max_single_dose_oz).state;
+          const float max_daily_dose_ppm = id(chlorine_pump_max_daily_dose_ppm).state;
+          const float minimum_rest_seconds = id(chlorine_pump_minimum_rest_seconds).state;
+          const float tank_level_oz = id(chlorine_pump_tank_level_oz).state;
+          const float tank_low_threshold_oz = id(chlorine_pump_tank_low_threshold_oz).state;
+          const float pre_run_seconds = id(chlorine_pump_pre_run_seconds).state;
+
+          id(chlorine_pump_dose_request_valid_state) = true;
+          id(chlorine_pump_started_water_pump_by_controller) = false;
+          id(chlorine_pump_blocked_reason_state) = "idle";
+          id(chlorine_pump_dose_blocked_reason).publish_state(id(chlorine_pump_blocked_reason_state));
+
+          if (id(chlorine_pump_dose_active_state)) {
+            id(chlorine_pump_dose_request_valid_state) = false;
+            id(chlorine_pump_blocked_reason_state) = "dose_in_progress";
+            id(chlorine_pump_dose_blocked_reason).publish_state(id(chlorine_pump_blocked_reason_state));
+          }
+          if (id(chlorine_pump_dose_active_state)) {
+            return;
+          }
+
+          if (id(chlorine_pump_dose_lockout_state)) {
+            id(chlorine_pump_dose_request_valid_state) = false;
+            id(chlorine_pump_blocked_reason_state) = "maintenance_lockout";
+            id(chlorine_pump_dose_blocked_reason).publish_state(id(chlorine_pump_blocked_reason_state));
+            return;
+          }
+
+          if (!id(water_pump_comm_healthy).state) {
+            id(chlorine_pump_dose_request_valid_state) = false;
+            id(chlorine_pump_blocked_reason_state) = "water_pump_comm_stale";
+            id(chlorine_pump_dose_blocked_reason).publish_state(id(chlorine_pump_blocked_reason_state));
+            return;
+          }
+
+          if (requested_oz <= 0.0f) {
+            id(chlorine_pump_dose_request_valid_state) = false;
+            id(chlorine_pump_blocked_reason_state) = "invalid_request";
+            id(chlorine_pump_dose_blocked_reason).publish_state(id(chlorine_pump_blocked_reason_state));
+            return;
+          }
+
+          if (oz_per_min <= 0.0f) {
+            id(chlorine_pump_dose_request_valid_state) = false;
+            id(chlorine_pump_blocked_reason_state) = "invalid_calibration";
+            id(chlorine_pump_dose_blocked_reason).publish_state(id(chlorine_pump_blocked_reason_state));
+            return;
+          }
+
+          if (requested_oz > max_single_dose) {
+            id(chlorine_pump_dose_request_valid_state) = false;
+            id(chlorine_pump_blocked_reason_state) = "dose_above_max_single";
+            id(chlorine_pump_dose_blocked_reason).publish_state(id(chlorine_pump_blocked_reason_state));
+            return;
+          }
+
+          if (tank_level_oz <= tank_low_threshold_oz) {
+            id(chlorine_pump_dose_request_valid_state) = false;
+            id(chlorine_pump_blocked_reason_state) = "chlorine_pump_tank_low";
+            id(chlorine_pump_dose_blocked_reason).publish_state(id(chlorine_pump_blocked_reason_state));
+            return;
+          }
+
+          if (requested_oz > tank_level_oz) {
+            id(chlorine_pump_dose_request_valid_state) = false;
+            id(chlorine_pump_blocked_reason_state) = "insufficient_tank_level";
+            id(chlorine_pump_dose_blocked_reason).publish_state(id(chlorine_pump_blocked_reason_state));
+            return;
+          }
+
+          const float pool_volume = id(pool_volume_gallons).state;
+          const float chlorine_strength = id(chlorine_pump_liquid_strength_percent).state;
+          float requested_ppm = 0.0f;
+          if (pool_volume > 0.0f && chlorine_strength > 0.0f) {
+            requested_ppm = requested_oz * chlorine_strength * 10000.0f / (128.0f * pool_volume);
+          }
+          if ((pool_volume <= 0.0f || chlorine_strength <= 0.0f) && max_daily_dose_ppm > 0.0f) {
+            id(chlorine_pump_dose_request_valid_state) = false;
+            id(chlorine_pump_blocked_reason_state) = "invalid_chemistry_config";
+            id(chlorine_pump_dose_blocked_reason).publish_state(id(chlorine_pump_blocked_reason_state));
+            return;
+          }
+
+          if (max_daily_dose_ppm > 0.0f && (id(chlorine_pump_ppm_day_0) + requested_ppm) > max_daily_dose_ppm) {
+            id(chlorine_pump_dose_request_valid_state) = false;
+            id(chlorine_pump_blocked_reason_state) = "dose_above_daily_max";
+            id(chlorine_pump_dose_blocked_reason).publish_state(id(chlorine_pump_blocked_reason_state));
+            return;
+          }
+
+          if (minimum_rest_seconds > 0.0f && id(homeassistant_time).now().is_valid() && id(chlorine_pump_last_dose_completed_epoch) > 0) {
+            const int32_t elapsed_since_last_dose = id(homeassistant_time).now().timestamp - id(chlorine_pump_last_dose_completed_epoch);
+            if (elapsed_since_last_dose >= 0 && elapsed_since_last_dose < minimum_rest_seconds) {
+              id(chlorine_pump_dose_request_valid_state) = false;
+              id(chlorine_pump_blocked_reason_state) = "minimum_rest_active";
+              id(chlorine_pump_dose_blocked_reason).publish_state(id(chlorine_pump_blocked_reason_state));
+              return;
+            }
+          }
+
+          id(chlorine_pump_dose_runtime_seconds_pending) = (requested_oz / oz_per_min) * 60.0f;
+          id(chlorine_pump_dose_total_runtime_seconds_requested) = id(chlorine_pump_dose_runtime_seconds_pending);
+          id(chlorine_pump_last_executed_oz) = requested_oz;
+          if (pool_volume > 0.0f && chlorine_strength > 0.0f) {
+            id(chlorine_pump_last_executed_ppm) = requested_ppm;
+          } else {
+            id(chlorine_pump_last_executed_ppm) = 0.0f;
+          }
+          id(chlorine_pump_last_executed_dose_oz_sensor).publish_state(id(chlorine_pump_last_executed_oz));
+          id(chlorine_pump_last_executed_dose_ppm_sensor).publish_state(id(chlorine_pump_last_executed_ppm));
+          id(chlorine_pump_dose_blocked_reason).publish_state(id(chlorine_pump_blocked_reason_state));
+          if (!id(water_pump_running_confirmed).state) {
+            id(chlorine_pump_started_water_pump_by_controller) = id(water_pump_switch_command).state <= 0.0f;
+          }
+          if (pre_run_seconds < 0.0f) {
+            id(chlorine_pump_pre_run_seconds).publish_state(0.0f);
+          }
+      - if:
+          condition:
+            lambda: |-
+              return !id(chlorine_pump_dose_request_valid_state);
+          then:
+            - script.stop: execute_requested_chlorine_pump_dose
+      - lambda: |-
+          id(chlorine_pump_dose_active_state) = true;
+          id(chlorine_pump_dose_active).publish_state(true);
+      - if:
+          condition:
+            lambda: |-
+              return !id(water_pump_running_confirmed).state;
+          then:
+            - switch.turn_on: water_pump
+      - delay: !lambda |-
+          return (uint32_t) (std::max(0.0f, id(chlorine_pump_pre_run_seconds).state) * 1000.0f);
+      - if:
+          condition:
+            lambda: |-
+              return !id(water_pump_comm_healthy).state;
+          then:
+            - lambda: |-
+                id(chlorine_pump_blocked_reason_state) = "water_pump_comm_stale";
+                id(chlorine_pump_dose_blocked_reason).publish_state(id(chlorine_pump_blocked_reason_state));
+            - script.execute: stop_active_chlorine_pump_dose
+            - script.stop: execute_requested_chlorine_pump_dose
+      - if:
+          condition:
+            lambda: |-
+              return !id(water_pump_running_confirmed).state;
+          then:
+            - lambda: |-
+                id(chlorine_pump_blocked_reason_state) = "water_pump_start_failed";
+                id(chlorine_pump_dose_blocked_reason).publish_state(id(chlorine_pump_blocked_reason_state));
+            - script.execute: stop_active_chlorine_pump_dose
+            - script.stop: execute_requested_chlorine_pump_dose
+      - switch.turn_on: relay1
+      - delay: !lambda |-
+          return (uint32_t) (std::max(0.0f, id(chlorine_pump_dose_total_runtime_seconds_requested)) * 1000.0f);
+      - if:
+          condition:
+            switch.is_on: relay1
+          then:
+            - switch.turn_off: relay1
+      - delay: !lambda |-
+          return (uint32_t) (std::max(0.0f, id(chlorine_pump_post_run_seconds).state) * 1000.0f);
+      - if:
+          condition:
+            lambda: |-
+              return id(chlorine_pump_started_water_pump_by_controller);
+          then:
+            - switch.turn_off: water_pump
+      - lambda: |-
+          id(chlorine_pump_last_completed_runtime_seconds) = id(chlorine_pump_dose_total_runtime_seconds_requested);
+          if (id(homeassistant_time).now().is_valid()) {
+            id(chlorine_pump_last_dose_completed_epoch) = id(homeassistant_time).now().timestamp;
+          }
+          id(chlorine_pump_dose_active_state) = false;
+          id(chlorine_pump_dose_runtime_seconds_pending) = 0.0f;
+          id(chlorine_pump_dose_total_runtime_seconds_requested) = 0.0f;
+          id(chlorine_pump_blocked_reason_state) = "idle";
+          id(chlorine_pump_started_water_pump_by_controller) = false;
+          id(chlorine_pump_dose_active).publish_state(false);
+          id(chlorine_pump_dose_blocked_reason).publish_state(id(chlorine_pump_blocked_reason_state));
+
+  - id: play_alarm_chirp
+    then:
+      - rtttl.play: "alarm:d=8,o=6,b=240:e,c"
+
+
+text_sensor:
+  - platform: template
+    id: controller_wifi_signal_status
+    name: "Controller WiFi Signal Status"
+    entity_category: diagnostic
+    lambda: |-
+      const float rssi = id(controller_wifi_signal_dbm).state;
+      if (isnan(rssi)) {
+        return {"unknown"};
+      }
+      if (rssi >= -75.0f) {
+        return {"good"};
+      }
+      if (rssi >= -80.0f) {
+        return {"fair"};
+      }
+      return {"poor"};
+    update_interval: ${slow_template_update_interval}
+
+  - platform: template
+    id: chlorine_pump_dose_blocked_reason
+    name: "Chlorine Pump Dose Blocked Reason"
+    entity_category: diagnostic
+    lambda: |-
+      return id(chlorine_pump_blocked_reason_state);
+    update_interval: ${slow_template_update_interval}
+
+  - platform: template
+    id: chlorine_pump_last_dose_completed_timestamp
+    name: "Chlorine Pump Dose Last Completed Timestamp"
+    entity_category: diagnostic
+    lambda: |-
+      if (id(chlorine_pump_last_dose_completed_epoch) == 0) {
+        return {"never"};
+      }
+      time_t completed_at = id(chlorine_pump_last_dose_completed_epoch);
+      struct tm *time_info = localtime(&completed_at);
+      if (time_info == nullptr) {
+        return {"unknown"};
+      }
+      char buffer[32];
+      strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", time_info);
+      return {buffer};
+    update_interval: ${slow_template_update_interval}
+
+  - platform: template
+    id: water_pump_control_state
+    name: "Water Pump Control State"
+    entity_category: diagnostic
+    lambda: |-
+      if (!id(water_pump_comm_healthy).state) {
+        return {"comm_stale"};
+      }
+      const float operating_min_rpm = id(water_pump_operating_min_rpm).state;
+      const float operating_max_rpm = id(water_pump_operating_max_rpm).state;
+      const float override_min_rpm = id(water_pump_min_rpm_override).state;
+      const float override_max_rpm = id(water_pump_max_rpm_override).state;
+      float effective_min_rpm = id(water_pump_min_rpm_override_active).state ? override_min_rpm : operating_min_rpm;
+      float effective_max_rpm = id(water_pump_max_rpm_override_active).state ? override_max_rpm : operating_max_rpm;
+      if (effective_max_rpm < effective_min_rpm) {
+        if (id(water_pump_max_rpm_override_active).state && !id(water_pump_min_rpm_override_active).state) {
+          effective_min_rpm = effective_max_rpm;
+        } else {
+          effective_max_rpm = effective_min_rpm;
+        }
+      }
+      float requested_rpm = id(water_pump_rpm_target_request).state;
+      const bool target_rpm_override_active = id(water_pump_target_rpm_override_active).state;
+      if (target_rpm_override_active) {
+        requested_rpm = id(water_pump_target_rpm_override).state;
+      }
+      if (!target_rpm_override_active) {
+        if (requested_rpm < effective_min_rpm) {
+          if (id(water_pump_min_rpm_override_active).state && override_min_rpm > operating_min_rpm) {
+            return {"clamped_by_min_override"};
+          }
+          return {"clamped_by_min_limit"};
+        }
+        if (requested_rpm > effective_max_rpm) {
+          if (id(water_pump_max_rpm_override_active).state && override_max_rpm < operating_max_rpm) {
+            return {"clamped_by_max_override"};
+          }
+          return {"clamped_by_max_limit"};
+        }
+      }
+      if (id(water_pump_running_confirmed).state) {
+        return {"running_confirmed"};
+      }
+      if (id(water_pump_switch_command).state > 0.0f) {
+        return {"enable_requested"};
+      }
+      return {"disabled"};
+    update_interval: ${controller_poll_interval}
+
+  - platform: template
+    id: chlorine_pump_control_state
+    name: "Chlorine Pump Control State"
+    entity_category: diagnostic
+    lambda: |-
+      if (id(chlorine_pump_dose_active_state)) {
+        return {"dose_active"};
+      }
+      if (id(chlorine_pump_dose_lockout_state)) {
+        return {"lockout"};
+      }
+      if (id(chlorine_pump_tank_low).state) {
+        return {"tank_low"};
+      }
+      if (id(chlorine_pump_blocked_reason_state) != "idle") {
+        return {"blocked"};
+      }
+      return {"idle"};
+    update_interval: ${controller_poll_interval}
+
+  - platform: template
+    id: water_pump_rpm_override_status
+    name: "Water Pump RPM Override Status"
+    entity_category: diagnostic
+    # This reports whether the live effective window is using the override minimum,
+    # maximum, both, or neither.
+    lambda: |-
+      const bool min_override_active = id(water_pump_min_rpm_override_active).state && fabsf(id(water_pump_min_rpm_override).state - id(water_pump_operating_min_rpm).state) >= 1.0f;
+      const bool max_override_active = id(water_pump_max_rpm_override_active).state && fabsf(id(water_pump_max_rpm_override).state - id(water_pump_operating_max_rpm).state) >= 1.0f;
+      const bool target_override_active = id(water_pump_target_rpm_override_active).state && fabsf(id(water_pump_target_rpm_override).state - id(water_pump_rpm_target_request).state) >= 1.0f;
+      if (min_override_active && max_override_active && target_override_active) {
+        return {"all"};
+      }
+      if (target_override_active && (min_override_active || max_override_active)) {
+        return {"target_and_limits"};
+      }
+      if (min_override_active && max_override_active) {
+        return {"both"};
+      }
+      if (min_override_active) {
+        return {"minimum"};
+      }
+      if (max_override_active) {
+        return {"maximum"};
+      }
+      if (target_override_active) {
+        return {"target"};
+      }
+      if (id(water_pump_min_rpm_override_active).state || id(water_pump_max_rpm_override_active).state || id(water_pump_target_rpm_override_active).state) {
+        return {"armed_no_change"};
+      }
+      return {"idle"};
+    update_interval: ${slow_template_update_interval}
+
+
+button:
+  - platform: template
+    name: "Chlorine Pump Execute Requested Dose"
+    on_press:
+      - script.execute: execute_requested_chlorine_pump_dose
+
+  - platform: template
+    name: "Chlorine Pump Stop Active Dose"
+    on_press:
+      - lambda: |-
+          id(chlorine_pump_blocked_reason_state) = "dose_stopped_manually";
+      - script.execute: stop_active_chlorine_pump_dose
+
+  - platform: restart
+    name: "Restart"
+    id: restart_button
+    entity_category: config
